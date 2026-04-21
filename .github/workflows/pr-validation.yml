@@ -11,12 +11,18 @@ on:
     branches: [ "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # diff-cover needs full history to compare against the PR base
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -30,18 +36,64 @@ jobs:
       # Do a build
       - name: Run Build
         run: npm run build
-      
+
       # Check whether the compiled library changed
       - name: Check Build Updated
         uses: tj-actions/verify-changed-files@v20
         id: verify-built-lib
         with:
           files: lib/index.js
-      
+
       # If it did change, the authro forgot to build. Fail the action
       - name: Verify Build Updated
-        if: steps.verify-changed-files.outputs.files_changed == 'true'
+        if: steps.verify-built-lib.outputs.files_changed == 'true'
         run: exit 1
 
-      - name: Run Tests
-        run: npm test
+      - name: Run Tests with Coverage
+        run: npm run test:coverage
+
+      - name: Set up Python
+        if: github.event_name == 'pull_request'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install diff-cover
+        if: github.event_name == 'pull_request'
+        run: pip install diff-cover
+
+      # Computes coverage of only the lines changed in this PR's diff and
+      # writes a markdown report. `continue-on-error` lets us still upload
+      # the report artifact below so the comment workflow can post it even
+      # when the gate trips.
+      - name: Generate diff coverage report
+        if: github.event_name == 'pull_request'
+        id: diff-cover
+        continue-on-error: true
+        run: |
+          diff-cover ./coverage/lcov.info \
+            --compare-branch=origin/${{ github.base_ref }} \
+            --fail-under=80 \
+            --format markdown:diff-coverage.md
+
+      # For fork PRs the GITHUB_TOKEN on pull_request runs is read-only, so we
+      # can't post a comment here. Upload the report + PR number as an artifact
+      # and let pr-coverage-comment.yml (workflow_run) post from the base repo.
+      - name: Save PR number
+        if: github.event_name == 'pull_request'
+        run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+
+      - name: Upload diff coverage report
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-coverage
+          path: |
+            diff-coverage.md
+            pr-number.txt
+
+      - name: Enforce diff coverage threshold
+        if: github.event_name == 'pull_request' && steps.diff-cover.outcome == 'failure'
+        run: |
+          echo "Diff coverage is below 80% - see the PR comment for details."
+          exit 1
